@@ -1,0 +1,3 @@
+PySimpleGUI-4-foss
+mysql-connector-python
+pyperclip
