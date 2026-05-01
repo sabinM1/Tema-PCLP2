@@ -17,34 +17,23 @@ from mediapipe.tasks.python import vision
 import numpy as np
 import urllib.request
 
-# Incercare import drawing utils (pot varia intre versiuni)
-try:
-    from mediapipe.framework.formats import landmark_pb2
-    from mediapipe import solutions
-    HAS_DRAWING_UTILS = True
-except ImportError:
-    HAS_DRAWING_UTILS = False
-
-
 # Formate audio suportate de pygame
 AUDIO_FORMATS = ('*.mp3', '*.ogg', '*.wav', '*.mid', '*.midi', '*.mod', '*.xm', '*.flac')
 
 # Conexiuni HAND_CONNECTIONS (din documentația MediaPipe)
 HAND_CONNECTIONS = frozenset([
-    (0, 1), (1, 2), (2, 3), (3, 4),           # deget mare
-    (0, 5), (5, 6), (6, 7), (7, 8),           # index
-    (0, 9), (9, 10), (10, 11), (11, 12),      # mijlociu
-    (0, 13), (13, 14), (14, 15), (15, 16),    # inelar
-    (0, 17), (17, 18), (18, 19), (19, 20),    # mic
-    (5, 9), (9, 13), (13, 17)                 # palmă
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    (5, 9), (9, 13), (13, 17)
 ])
 
 
-# --- PARTEA II: RECUNOAȘTERE GESTURI ---
 class GestureRecognizer:
-    """Recunoaște gesturi folosind MediaPipe HandLandmarker (Tasks API)"""
+    """Recunoaște gesturi folosind MediaPipe HandLandmarker"""
 
-    # Landmark indices pentru detectare gesturi
     WRIST, THUMB_TIP, INDEX_TIP, INDEX_PIP = 0, 4, 8, 6
     MIDDLE_TIP, MIDDLE_PIP, RING_TIP, RING_PIP = 12, 10, 16, 14
     PINKY_TIP, PINKY_PIP = 20, 18
@@ -65,17 +54,14 @@ class GestureRecognizer:
         self.detector = vision.HandLandmarker.create_from_options(options)
 
     def _descarca_model(self):
-        """Descarcă modelul dacă nu există"""
         if not os.path.exists(self.MODEL_PATH):
             print("Se descarcă modelul MediaPipe...")
             urllib.request.urlretrieve(self.MODEL_URL, self.MODEL_PATH)
             print("Model descărcat!")
 
     def detecteaza_gest(self, frame):
-        """Detectează gestul din frame"""
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
         results = self.detector.detect(mp_image)
 
         if not results.hand_landmarks:
@@ -83,29 +69,25 @@ class GestureRecognizer:
 
         landmarks = results.hand_landmarks[0]
 
-        # Verifică gesturi
-        if self._este_pumn(landmarks): return "FIST", landmarks
+        # Verifică gesturi în ordinea specificității (cele mai unice primele)
         if self._este_ok(landmarks): return "OK", landmarks
         if self._este_rock(landmarks): return "ROCK", landmarks
-        if self._este_palma(landmarks): return "PALM", landmarks
         if self._este_index_sus(landmarks): return "UP", landmarks
         if self._este_index_jos(landmarks): return "DOWN", landmarks
+        if self._este_palma(landmarks): return "PALM", landmarks
+        if self._este_pumn(landmarks): return "FIST", landmarks
 
         return None, landmarks
 
     def deseneaza(self, frame, landmarks):
-        """Desenează landmarkurile pe frame"""
         if not landmarks:
             return frame
 
         h, w, _ = frame.shape
-
-        # Desenează puncte
         for lm in landmarks:
             cx, cy = int(lm.x * w), int(lm.y * h)
             cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
 
-        # Desenează conexiuni folosind HAND_CONNECTIONS
         for start, end in HAND_CONNECTIONS:
             if start < len(landmarks) and end < len(landmarks):
                 x1, y1 = int(landmarks[start].x * w), int(landmarks[start].y * h)
@@ -124,10 +106,22 @@ class GestureRecognizer:
         return lm[tip].y < lm[pip].y
 
     def _este_pumn(self, lm):
-        return all(self._indoit(lm, t, p) for t, p in [
-            (self.INDEX_TIP, self.INDEX_PIP), (self.MIDDLE_TIP, self.MIDDLE_PIP),
-            (self.RING_TIP, self.RING_PIP), (self.PINKY_TIP, self.PINKY_PIP)
-        ])
+        # Toate degetele pliate clar (nu doar comparând y, ci distanță față de palmă)
+        degete_pliate = all(
+            lm[tip].y > lm[pip].y + 0.03
+            for tip, pip in [
+                (self.INDEX_TIP, self.INDEX_PIP),
+                (self.MIDDLE_TIP, self.MIDDLE_PIP),
+                (self.RING_TIP, self.RING_PIP),
+                (self.PINKY_TIP, self.PINKY_PIP)
+            ]
+        )
+        # Degetele trebuie să fie aproape de palmă (nu întinse)
+        distanta_mica = all(
+            self._dist(lm[tip], lm[self.WRIST]) < 0.25
+            for tip in [self.INDEX_TIP, self.MIDDLE_TIP, self.RING_TIP, self.PINKY_TIP]
+        )
+        return degete_pliate and distanta_mica
 
     def _este_palma(self, lm):
         return all(self._intins(lm, t, p) for t, p in [
@@ -151,84 +145,64 @@ class GestureRecognizer:
                 self._indoit(lm, self.PINKY_TIP, self.PINKY_PIP))
 
     def _este_index_jos(self, lm):
-        return (lm[self.INDEX_TIP].y > lm[self.WRIST].y and
-                self._indoit(lm, self.MIDDLE_TIP, self.MIDDLE_PIP) and
-                self._indoit(lm, self.RING_TIP, self.RING_PIP) and
-                self._indoit(lm, self.PINKY_TIP, self.PINKY_PIP))
+        # Index pliat clar în jos, celelalte degete întinse în sus
+        index_pliat = lm[self.INDEX_TIP].y > lm[self.INDEX_PIP].y + 0.05
+        mijlociu_intins = lm[self.MIDDLE_TIP].y < lm[self.MIDDLE_PIP].y - 0.05
+        inelar_intins = lm[self.RING_TIP].y < lm[self.RING_PIP].y - 0.05
+        mic_intins = lm[self.PINKY_TIP].y < lm[self.PINKY_PIP].y - 0.05
+        # Index trebuie să fie vizibil sub celelalte degete
+        index_jos = lm[self.INDEX_TIP].y > lm[self.MIDDLE_TIP].y
+        return index_pliat and mijlociu_intins and inelar_intins and mic_intins and index_jos
 
 
-# --- PARTEA III: REDARE VIDEO ---
-class VideoPlayer:
-    def __init__(self, window, key):
-        self.window = window
-        self.key = key
-        self.cap = None
+class AudioPlayer:
+    """Redă fișiere audio folosind pygame.mixer"""
+
+    def __init__(self):
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         self.playing = False
         self.paused = False
-        self.thread = None
-        self.lock = threading.Lock()
-        pygame.mixer.init()
+        self.current_file = None
 
-    def incarca(self, cale):
-        self.cap = cv2.VideoCapture(cale)
-        if not self.cap.isOpened():
+    def load(self, filepath):
+        """Încarcă fișierul audio"""
+        try:
+            pygame.mixer.music.load(filepath)
+            self.current_file = filepath
+            return True
+        except Exception as e:
+            print(f"Eroare la încărcarea audio: {e}")
             return False
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        self.frame_delay = 1.0 / self.fps
-        return True
 
-    def reda(self):
-        with self.lock:
+    def play(self):
+        """Pornește redarea"""
+        if self.current_file:
+            pygame.mixer.music.play()
             self.playing = True
             self.paused = False
-        self.thread = threading.Thread(target=self._bucla, daemon=True)
-        self.thread.start()
 
-    def pauza(self):
-        with self.lock:
+    def pause(self):
+        """Pauză"""
+        if self.playing and not self.paused:
+            pygame.mixer.music.pause()
             self.paused = True
 
     def resume(self):
-        with self.lock:
+        """Reluare"""
+        if self.playing and self.paused:
+            pygame.mixer.music.unpause()
             self.paused = False
 
     def stop(self):
-        with self.lock:
-            self.playing = False
-            self.paused = False
-        if self.cap:
-            self.cap.release()
+        """Oprește redarea"""
         pygame.mixer.music.stop()
+        self.playing = False
+        self.paused = False
 
-    def _bucla(self):
-        while True:
-            with self.lock:
-                if not self.playing:
-                    break
-                if self.paused:
-                    time.sleep(0.05)
-                    continue
-
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_rgb = cv2.resize(frame_rgb, (640, 480))
-            img = cv2.imencode('.png', frame_rgb)[1].tobytes()
-
-            try:
-                self.window.write_event_value("-FRAME-", img)
-            except:
-                break
-
-            time.sleep(self.frame_delay)
-
-        with self.lock:
-            self.playing = False
+    def is_playing(self):
+        return pygame.mixer.music.get_busy()
 
 
-# --- PARTEA IV: PLAYLIST ---
 class Playlist:
     def __init__(self, folder):
         self.folder = folder
@@ -239,7 +213,6 @@ class Playlist:
     def scaneaza(self):
         if not os.path.exists(self.folder):
             os.makedirs(self.folder, exist_ok=True)
-        # Caută toate formatele audio suportate
         self.melodii = []
         for fmt in AUDIO_FORMATS:
             self.melodii.extend(glob.glob(os.path.join(self.folder, fmt)))
@@ -264,20 +237,19 @@ class Playlist:
             self.idx = (self.idx + 1) % len(self.melodii)
 
 
-# --- PARTEA V: INTERFAȚA GRAFICĂ ---
 class AudioPlayerGUI:
     def __init__(self, folder):
         sg.theme("LightBlue3")
         self.playlist = Playlist(folder)
         self.gest = GestureRecognizer()
         self.camera = cv2.VideoCapture(0)
-        self.player = None
+        self.audio = AudioPlayer()
         self.mod = "BROWSE"
         self.win_browse = None
         self.win_play = None
-        # Cooldown pentru gesturi (secunde)
+        self.running = True
         self.ultimul_gest_timp = 0
-        self.cooldown_gest = 0.8  # 800ms intre gesturi
+        self.cooldown_gest = 0.8
         self.creaza_browse()
 
     def creaza_browse(self):
@@ -297,15 +269,15 @@ class AudioPlayerGUI:
     def creaza_play(self):
         layout = [
             [sg.Text("REDARE", font=("Helvetica", 14, "bold"))],
-            [sg.Image(filename="", key="-VIDEO-", size=(640, 480))],
+            [sg.Image(filename="", key="-CAM-", size=(320, 240))],
+            [sg.Text(self.playlist.nume(), font=("Helvetica", 12), key="-NUME-")],
             [sg.Text("Gest detectat: -", key="-GEST-")],
             [sg.Text("✋ Palmă: pauză | 👌 OK: resume | 🤘 Rock: stop", font=("Helvetica", 10))],
             [sg.Button("Înapoi", key="-BACK-")]
         ]
-        self.win_play = sg.Window("Redare", layout, finalize=True, size=(700, 600))
-        self.player = VideoPlayer(self.win_play, "-VIDEO-")
+        self.win_play = sg.Window("Redare", layout, finalize=True, size=(500, 500))
 
-    def actualizeaza_cam(self):
+    def actualizeaza_cam(self, window, key="-CAM-"):
         ret, frame = self.camera.read()
         if not ret:
             return None
@@ -316,19 +288,21 @@ class AudioPlayerGUI:
         frame = cv2.resize(frame, (320, 240))
 
         img = cv2.imencode('.png', frame)[1].tobytes()
-        self.win_browse["-CAM-"].update(data=img)
+        try:
+            window[key].update(data=img)
+        except:
+            pass
 
         return gest
 
-    def proceseaza(self, gest):
+    def proceseaza_gest(self, gest):
         if not gest:
             return
-        
-        # Verifică cooldown
+
         timp_curent = time.time()
         if timp_curent - self.ultimul_gest_timp < self.cooldown_gest:
-            return  # Ignoră gestul dacă e în cooldown
-        
+            return
+
         self.ultimul_gest_timp = timp_curent
 
         if self.mod == "BROWSE":
@@ -342,79 +316,108 @@ class AudioPlayerGUI:
                 self._start_play()
         else:
             if gest == "PALM":
-                self.player.pauza()
+                self.audio.pause()
+                self._update_status("Pauză")
             elif gest == "OK":
-                self.player.resume()
+                self.audio.resume()
+                self._update_status("Redare...")
             elif gest == "ROCK":
                 self._stop_play()
 
     def _update_list(self):
-        self.win_browse["-LIST-"].update(set_to_index=self.playlist.idx)
-        self.win_browse["-STATUS-"].update(f"Selectat: {self.playlist.nume()}")
+        try:
+            self.win_browse["-LIST-"].update(set_to_index=self.playlist.idx)
+            self.win_browse["-STATUS-"].update(f"Selectat: {self.playlist.nume()}")
+        except:
+            pass
+
+    def _update_status(self, text):
+        try:
+            if self.mod == "PLAYBACK":
+                self.win_play["-GEST-"].update(f"Gest detectat: {text}")
+        except:
+            pass
 
     def _start_play(self):
+        cale = self.playlist.curent()
+        if not cale:
+            return
+
+        if not self.audio.load(cale):
+            sg.popup_error("Eroare la încărcarea fișierului audio!")
+            return
+
+        self.audio.play()
         self.mod = "PLAYBACK"
         self.win_browse.hide()
         self.creaza_play()
 
-        if self.player.incarca(self.playlist.curent()):
-            self.player.reda()
-        else:
-            sg.popup_error("Eroare la încărcarea video-ului!")
-            self._stop_play()
-
     def _stop_play(self):
-        if self.player:
-            self.player.stop()
-        self.win_play.close()
-        self.win_browse.un_hide()
+        self.audio.stop()
         self.mod = "BROWSE"
-        self.player = None
+        try:
+            self.win_play.close()
+            self.win_browse.un_hide()
+        except:
+            pass
 
     def run(self):
-        while True:
-            win = self.win_play if self.mod == "PLAYBACK" else self.win_browse
-            event, values = win.read(timeout=50)
-
-            if event == sg.WIN_CLOSED:
-                break
-
-            if event == "-BACK-":
-                self._stop_play()
-
-            if event == "-FRAME-" and self.mod == "PLAYBACK":
-                try:
-                    self.win_play["-VIDEO-"].update(data=values[event])
-                except:
-                    pass
-
-            # Procesează gesturi
+        while self.running:
             if self.mod == "BROWSE":
-                gest = self.actualizeaza_cam()
+                event, values = self.win_browse.read(timeout=50)
+
+                if event == sg.WIN_CLOSED:
+                    self.running = False
+                    break
+
+                gest = self.actualizeaza_cam(self.win_browse)
                 if gest:
-                    self.proceseaza(gest)
+                    self.proceseaza_gest(gest)
                     self.win_browse["-STATUS-"].update(f"Detectat: {gest}")
-            else:
-                ret, frame = self.camera.read()
-                if ret:
-                    gest, _ = self.gest.detecteaza_gest(cv2.flip(frame, 1))
-                    if gest:
-                        self.proceseaza(gest)
-                        self.win_play["-GEST-"].update(f"Gest detectat: {gest}")
+
+            else:  # PLAYBACK mode
+                event, values = self.win_play.read(timeout=50)
+
+                if event == sg.WIN_CLOSED:
+                    self.audio.stop()
+                    self.mod = "BROWSE"
+                    try:
+                        self.win_play.close()
+                        self.win_browse.un_hide()
+                    except:
+                        pass
+                    continue
+
+                if event == "-BACK-":
+                    self._stop_play()
+                    continue
+
+                # Verifică dacă modul s-a schimbat (gest ROCK a apelat _stop_play)
+                if self.mod != "PLAYBACK":
+                    continue
+
+                gest = self.actualizeaza_cam(self.win_play)
+                if gest and self.mod == "PLAYBACK":
+                    self.proceseaza_gest(gest)
+                    if self.mod == "PLAYBACK":
+                        try:
+                            self.win_play["-GEST-"].update(f"Gest detectat: {gest}")
+                        except:
+                            pass
 
         # Cleanup
         self.camera.release()
-        if self.player:
-            self.player.stop()
-        self.win_browse.close()
+        self.audio.stop()
+        try:
+            self.win_browse.close()
+        except:
+            pass
 
 
-# --- PARTEA VI: BLOCUL PRINCIPAL ---
 if __name__ == "__main__":
     folder = os.path.join(os.path.dirname(__file__), "melodii")
     os.makedirs(folder, exist_ok=True)
 
-    # Verifică dacă există fișiere audio
     melodii_existente = []
     for fmt in AUDIO_FORMATS:
         melodii_existente.extend(glob.glob(os.path.join(folder, fmt)))
