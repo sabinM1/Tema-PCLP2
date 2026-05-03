@@ -16,9 +16,13 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
 import urllib.request
+import tempfile
+import subprocess
 
-# Formate audio suportate de pygame
+# Formate suportate (audio + video)
 AUDIO_FORMATS = ('*.mp3', '*.ogg', '*.wav', '*.mid', '*.midi', '*.mod', '*.xm', '*.flac')
+VIDEO_FORMATS = ('*.mp4', '*.avi', '*.mkv', '*.mov', '*.webm')
+ALL_FORMATS = AUDIO_FORMATS + VIDEO_FORMATS
 
 # Conexiuni HAND_CONNECTIONS (din documentația MediaPipe)
 HAND_CONNECTIONS = frozenset([
@@ -155,19 +159,143 @@ class GestureRecognizer:
         return index_pliat and mijlociu_intins and inelar_intins and mic_intins and index_jos
 
 
+class AudioExtractor:
+    """Manager pentru extragerea audio în background"""
+
+    def __init__(self):
+        self.extraction_cache = {}  # video_path -> audio_path
+        self.extraction_status = {}  # video_path -> 'pending' | 'done' | 'error'
+        self.lock = threading.Lock()
+        self.temp_files = []
+
+    def _is_video_file(self, filepath):
+        ext = os.path.splitext(filepath)[1].lower()
+        return ext in ['.mp4', '.avi', '.mkv', '.mov', '.webm']
+
+    def _extract_single(self, video_path):
+        """Extrage audio dintr-un singur fișier video"""
+        try:
+            temp_dir = tempfile.gettempdir()
+            # Folosește hash-ul căii pentru nume consistent
+            import hashlib
+            path_hash = hashlib.md5(video_path.encode()).hexdigest()[:12]
+            temp_audio = os.path.join(temp_dir, f"audio_{path_hash}.mp3")
+
+            # Dacă există deja, nu mai extrage
+            if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                with self.lock:
+                    self.extraction_cache[video_path] = temp_audio
+                    self.extraction_status[video_path] = 'done'
+                return temp_audio
+
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-vn',
+                '-acodec', 'libmp3lame',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',
+                temp_audio
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0 and os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                with self.lock:
+                    self.extraction_cache[video_path] = temp_audio
+                    self.extraction_status[video_path] = 'done'
+                    self.temp_files.append(temp_audio)
+                print(f"✓ Extras: {os.path.basename(video_path)}")
+                return temp_audio
+            else:
+                with self.lock:
+                    self.extraction_status[video_path] = 'error'
+                return None
+        except FileNotFoundError:
+            print("EROARE: FFmpeg nu este instalat. Instalează FFmpeg pentru suport video.")
+            print("Windows: winget install Gyan.FFmpeg")
+            with self.lock:
+                self.extraction_status[video_path] = 'error'
+            return None
+        except Exception as e:
+            print(f"Eroare extragere {video_path}: {e}")
+            with self.lock:
+                self.extraction_status[video_path] = 'error'
+            return None
+
+    def pre_extract_all(self, video_files):
+        """Pornește extragerea în background pentru toate fișierele video"""
+        for vf in video_files:
+            self.extraction_status[vf] = 'pending'
+
+        def extract_worker():
+            for vf in video_files:
+                if self.extraction_status.get(vf) == 'pending':
+                    self._extract_single(vf)
+
+        thread = threading.Thread(target=extract_worker, daemon=True)
+        thread.start()
+        return thread
+
+    def get_audio_path(self, video_path, timeout=None):
+        """Obține calea audio, așteptând dacă e necesar"""
+        if not self._is_video_file(video_path):
+            return video_path  # Nu e video, returnează direct
+
+        # Așteaptă până e gata
+        start_time = time.time()
+        while True:
+            with self.lock:
+                status = self.extraction_status.get(video_path)
+                if status == 'done':
+                    return self.extraction_cache.get(video_path)
+                if status == 'error':
+                    return None
+
+            if timeout and (time.time() - start_time) > timeout:
+                return None
+
+            time.sleep(0.1)
+
+    def is_ready(self, video_path):
+        """Verifică dacă extragerea e gata"""
+        if not self._is_video_file(video_path):
+            return True
+        with self.lock:
+            return self.extraction_status.get(video_path) == 'done'
+
+    def cleanup(self):
+        """Șterge fișierele temporare"""
+        for f in self.temp_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except:
+                pass
+
+
 class AudioPlayer:
     """Redă fișiere audio folosind pygame.mixer"""
 
-    def __init__(self):
+    def __init__(self, extractor):
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         self.playing = False
         self.paused = False
         self.current_file = None
+        self.extractor = extractor
 
     def load(self, filepath):
-        """Încarcă fișierul audio"""
+        """Încarcă fișierul audio (așteaptă extragerea dacă e necesar)"""
         try:
-            pygame.mixer.music.load(filepath)
+            # Obține calea audio (așteaptă extragerea dacă e video)
+            audio_path = self.extractor.get_audio_path(filepath, timeout=None)
+
+            if audio_path is None:
+                print(f"Eroare: nu s-a putut obține audio pentru {filepath}")
+                return False
+
+            pygame.mixer.music.load(audio_path)
             self.current_file = filepath
             return True
         except Exception as e:
@@ -214,7 +342,7 @@ class Playlist:
         if not os.path.exists(self.folder):
             os.makedirs(self.folder, exist_ok=True)
         self.melodii = []
-        for fmt in AUDIO_FORMATS:
+        for fmt in ALL_FORMATS:
             self.melodii.extend(glob.glob(os.path.join(self.folder, fmt)))
         self.melodii = sorted(self.melodii)
         self.idx = 0 if self.melodii else -1
@@ -243,7 +371,15 @@ class AudioPlayerGUI:
         self.playlist = Playlist(folder)
         self.gest = GestureRecognizer()
         self.camera = cv2.VideoCapture(0)
-        self.audio = AudioPlayer()
+
+        # Creează extractor și pornește extragerea în background
+        self.extractor = AudioExtractor()
+        video_files = [m for m in self.playlist.melodii if self.extractor._is_video_file(m)]
+        if video_files:
+            print(f"Se extrag audio din {len(video_files)} fișiere video în background...")
+            self.extractor.pre_extract_all(video_files)
+
+        self.audio = AudioPlayer(self.extractor)
         self.mod = "BROWSE"
         self.win_browse = None
         self.win_play = None
@@ -260,7 +396,8 @@ class AudioPlayerGUI:
                        default_values=[melodii[self.playlist.idx]] if melodii else [])],
             [sg.Image(filename="", key="-CAM-", size=(320, 240))],
             [sg.Text("☝️ Sus/Jos: navigare | ✊ Pumn: redare", font=("Helvetica", 10))],
-            [sg.Text("Status: Așteaptă gest...", key="-STATUS-", size=(40, 1))]
+            [sg.Text("Status: Așteaptă gest...", key="-STATUS-", size=(40, 1))],
+            [sg.Text("", key="-EXTRACT-", size=(50, 1), text_color="blue")]
         ]
         self.win_browse = sg.Window("AudioPlayer", layout, finalize=True)
         if melodii:
@@ -343,6 +480,11 @@ class AudioPlayerGUI:
         if not cale:
             return
 
+        # Verifică dacă e video și încă se extrage
+        if self.extractor._is_video_file(cale):
+            self.win_browse["-STATUS-"].update("Se pregătește audio...")
+            self.win_browse.refresh()
+
         if not self.audio.load(cale):
             sg.popup_error("Eroare la încărcarea fișierului audio!")
             return
@@ -369,6 +511,16 @@ class AudioPlayerGUI:
                 if event == sg.WIN_CLOSED:
                     self.running = False
                     break
+
+                # Actualizează status extragere
+                cale = self.playlist.curent()
+                if cale and self.extractor._is_video_file(cale):
+                    if self.extractor.is_ready(cale):
+                        self.win_browse["-EXTRACT-"].update("✓ Audio pregătit")
+                    else:
+                        self.win_browse["-EXTRACT-"].update("⏳ Se extrage audio...")
+                else:
+                    self.win_browse["-EXTRACT-"].update("")
 
                 gest = self.actualizeaza_cam(self.win_browse)
                 if gest:
@@ -408,6 +560,7 @@ class AudioPlayerGUI:
         # Cleanup
         self.camera.release()
         self.audio.stop()
+        self.extractor.cleanup()
         try:
             self.win_browse.close()
         except:
@@ -419,16 +572,17 @@ if __name__ == "__main__":
     os.makedirs(folder, exist_ok=True)
 
     melodii_existente = []
-    for fmt in AUDIO_FORMATS:
+    for fmt in ALL_FORMATS:
         melodii_existente.extend(glob.glob(os.path.join(folder, fmt)))
 
     if not melodii_existente:
         sg.popup(
             f"Folderul cu melodii este gol!\n\n"
             f"PATH complet: {folder}\n\n"
-            f"Formate suportate: MP3, OGG, WAV, MIDI, MOD, XM, FLAC\n\n"
-            f"Adăugați fișiere audio în acest folder înainte de rulare.",
-            title="Atenție - Nu există melodii",
+            f"Formate audio: MP3, OGG, WAV, MIDI, MOD, XM, FLAC\n"
+            f"Formate video (extrage audio): MP4, AVI, MKV, MOV, WEBM\n\n"
+            f"Adăugați fișiere în acest folder înainte de rulare.",
+            title="Atenție - Nu există fișiere",
             custom_text="Închide"
         )
         raise SystemExit(0)

@@ -1,9 +1,9 @@
-# NOTA: MediaPipe nu suporta Python 3.13
-# Folositi Python 3.12 sau mai mic
-# Download: https://www.python.org/downloads/release/python-31210/
-
 PySimpleGUI-4-foss
 mediapipe
 opencv-python
 pygame
 numpy
+
+# NOTĂ: Pentru suport video (MP4, AVI, etc.), instalează FFmpeg:
+# Windows: https://ffmpeg.org/download.html (descarcă și adaugă în PATH)
+# Sau cu winget: winget install Gyan.FFmpeg
